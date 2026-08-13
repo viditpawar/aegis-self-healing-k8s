@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-app
+  namespace: aegis-workloads
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: demo-app
+  namespaceSelector:
+    matchNames:
+      - aegis-workloads
+  endpoints:
+    - port: http
+      interval: 15s
+      path: /metrics
