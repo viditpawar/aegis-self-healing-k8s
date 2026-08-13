@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-discord
+  namespace: aegis-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager-discord
+  template:
+    metadata:
+      labels:
+        app: alertmanager-discord
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alertmanager-discord
+          image: benjojo/alertmanager-discord:latest
+          ports:
+            - containerPort: 9094
+          env:
+            - name: DISCORD_WEBHOOK
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: DISCORD_WEBHOOK_URL
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-discord
+  namespace: aegis-system
+spec:
+  selector:
+    app: alertmanager-discord
+  ports:
+    - port: 9094
+      targetPort: 9094
