@@ -8,8 +8,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+)
+
+const (
+	targetNamespace  = "aegis-workloads"
+	informerResync   = 30 * time.Second
+	pendingSweepTick = 30 * time.Second
 )
 
 func main() {
@@ -23,26 +31,63 @@ func main() {
 		log.Fatalf("failed to create clientset: %v", err)
 	}
 
-	log.Println("Aegis controller started, watching pods")
+	log.Println("Aegis controller started, watching pods in", targetNamespace)
 
-	for {
-		pods, err := clientset.CoreV1().Pods("aegis-workloads").List(
-			context.TODO(), metav1.ListOptions{})
+	factory := informers.NewSharedInformerFactoryWithOptions(
+		clientset, informerResync,
+		informers.WithNamespace(targetNamespace),
+	)
+	podInformer := factory.Core().V1().Pods().Informer()
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			onPodEvent(clientset, obj)
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			onPodEvent(clientset, newObj)
+		},
+	})
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	factory.Start(stopCh)
+	if !cache.WaitForCacheSync(stopCh, podInformer.HasSynced) {
+		log.Fatal("failed to sync pod informer cache")
+	}
+
+	go sweepPendingPods(clientset, pendingSweepTick)
+
+	<-stopCh
+}
+
+func onPodEvent(clientset *kubernetes.Clientset, obj interface{}) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	remediateCrashLoop(clientset, *pod)
+}
+
+// sweepPendingPods polls on a ticker because informers only fire on state
+// changes, and a pod sitting idle in Pending never produces one.
+func sweepPendingPods(clientset *kubernetes.Clientset, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		pods, err := clientset.CoreV1().Pods(targetNamespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			log.Printf("error listing pods: %v", err)
-			time.Sleep(10 * time.Second)
 			continue
 		}
-
 		for _, pod := range pods.Items {
-			remediateIfNeeded(clientset, pod)
+			remediatePending(clientset, pod)
 		}
-
-		time.Sleep(15 * time.Second)
 	}
 }
 
-func remediateIfNeeded(clientset *kubernetes.Clientset, pod corev1.Pod) {
+func remediateCrashLoop(clientset *kubernetes.Clientset, pod corev1.Pod) {
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.RestartCount > 5 && cs.State.Waiting != nil &&
 			cs.State.Waiting.Reason == "CrashLoopBackOff" {
@@ -52,7 +97,9 @@ func remediateIfNeeded(clientset *kubernetes.Clientset, pod corev1.Pod) {
 				context.TODO(), pod.Name, metav1.DeleteOptions{})
 		}
 	}
+}
 
+func remediatePending(clientset *kubernetes.Clientset, pod corev1.Pod) {
 	if pod.Status.Phase == corev1.PodPending {
 		age := time.Since(pod.CreationTimestamp.Time)
 		if age > 5*time.Minute {
