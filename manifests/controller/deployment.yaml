@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-controller
+  namespace: aegis-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aegis-controller
+  template:
+    metadata:
+      labels:
+        app: aegis-controller
+    spec:
+      serviceAccountName: aegis-controller
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aegis-controller
+          image: aegis-controller:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aegis-controller
+  namespace: aegis-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aegis-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aegis-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: aegis-controller
+    namespace: aegis-system
+roleRef:
+  kind: ClusterRole
+  name: aegis-controller-role
+  apiGroup: rbac.authorization.k8s.io
