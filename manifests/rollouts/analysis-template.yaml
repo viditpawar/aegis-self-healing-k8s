@@ -9,7 +9,7 @@ spec:
       initialDelay: 60s
       interval: 30s
       count: 5
-      successCondition: result >= 0.95
+      successCondition: result[0] >= 0.95
       provider:
         prometheus:
           address: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
