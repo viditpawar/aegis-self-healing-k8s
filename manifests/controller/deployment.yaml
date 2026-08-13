@@ -22,8 +22,26 @@ spec:
         - name: aegis-controller
           image: aegis-controller:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 8080
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-controller-metrics
+  namespace: aegis-system
+  labels:
+    app: aegis-controller
+spec:
+  selector:
+    app: aegis-controller
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080

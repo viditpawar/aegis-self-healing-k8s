@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -10,26 +9,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/k8sclient"
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/metrics"
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/remediate"
 )
 
 const (
 	targetNamespace  = "aegis-workloads"
 	informerResync   = 30 * time.Second
 	pendingSweepTick = 30 * time.Second
+	metricsAddr      = ":8080"
 )
 
 func main() {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatalf("failed to load in cluster config: %v", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := k8sclient.New()
 	if err != nil {
 		log.Fatalf("failed to create clientset: %v", err)
 	}
+
+	go metrics.Serve(metricsAddr)
 
 	log.Println("Aegis controller started, watching pods in", targetNamespace)
 
@@ -66,7 +66,10 @@ func onPodEvent(clientset *kubernetes.Clientset, obj interface{}) {
 	if !ok {
 		return
 	}
-	remediateCrashLoop(clientset, *pod)
+	if shouldDelete, reason := remediate.CrashLoopDecision(*pod); shouldDelete {
+		deletePod(clientset, *pod, reason)
+		metrics.CrashLoopDeletions.Inc()
+	}
 }
 
 // sweepPendingPods polls on a ticker because informers only fire on state
@@ -82,31 +85,18 @@ func sweepPendingPods(clientset *kubernetes.Clientset, interval time.Duration) {
 			continue
 		}
 		for _, pod := range pods.Items {
-			remediatePending(clientset, pod)
+			if shouldDelete, reason := remediate.PendingDecision(pod, time.Now()); shouldDelete {
+				deletePod(clientset, pod, reason)
+				metrics.PendingDeletions.Inc()
+			}
 		}
 	}
 }
 
-func remediateCrashLoop(clientset *kubernetes.Clientset, pod corev1.Pod) {
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.RestartCount > 5 && cs.State.Waiting != nil &&
-			cs.State.Waiting.Reason == "CrashLoopBackOff" {
-			fmt.Printf("Pod %s in CrashLoopBackOff, restart count %d, deleting to force reschedule\n",
-				pod.Name, cs.RestartCount)
-			clientset.CoreV1().Pods(pod.Namespace).Delete(
-				context.TODO(), pod.Name, metav1.DeleteOptions{})
-		}
-	}
-}
-
-func remediatePending(clientset *kubernetes.Clientset, pod corev1.Pod) {
-	if pod.Status.Phase == corev1.PodPending {
-		age := time.Since(pod.CreationTimestamp.Time)
-		if age > 5*time.Minute {
-			fmt.Printf("Pod %s stuck Pending for %v, deleting to force reschedule\n",
-				pod.Name, age)
-			clientset.CoreV1().Pods(pod.Namespace).Delete(
-				context.TODO(), pod.Name, metav1.DeleteOptions{})
-		}
+func deletePod(clientset *kubernetes.Clientset, pod corev1.Pod, reason string) {
+	log.Printf("Pod %s: %s, deleting to force reschedule", pod.Name, reason)
+	if err := clientset.CoreV1().Pods(pod.Namespace).Delete(
+		context.TODO(), pod.Name, metav1.DeleteOptions{}); err != nil {
+		log.Printf("failed to delete pod %s: %v", pod.Name, err)
 	}
 }
