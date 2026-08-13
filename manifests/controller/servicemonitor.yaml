@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aegis-controller
+  namespace: aegis-system
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: aegis-controller
+  namespaceSelector:
+    matchNames:
+      - aegis-system
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
