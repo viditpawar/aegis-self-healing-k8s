@@ -11,7 +11,7 @@ alertmanager:
       routes:
         - receiver: discord
           matchers:
-            - alertname = "PodCrashLooping"
+            - alertname =~ "PodCrashLooping|Aegis.*"
     receivers:
       - name: "null"
       - name: discord

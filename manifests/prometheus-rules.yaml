@@ -9,10 +9,53 @@ spec:
   groups:
     - name: aegis.pod.health
       rules:
+        # Restarts in the last 15 minutes, not the lifetime total: the counter
+        # never resets, so "total > 5" fires forever for any pod that ever
+        # restarted (e.g. every pod after a few cluster stop/starts).
         - alert: PodCrashLooping
-          expr: kube_pod_container_status_restarts_total > 5
+          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
           for: 2m
           labels:
             severity: warning
           annotations:
-            summary: "Pod {{ $labels.pod }} is crash looping"
+            summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping"
+            description: "Container {{ $labels.container }} restarted {{ $value | humanize }} times in the last 15 minutes."
+
+    - name: aegis.controller
+      rules:
+        - alert: AegisControllerDown
+          expr: sum(up{job="aegis-controller-metrics"}) == 0 or absent(up{job="aegis-controller-metrics"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No aegis-controller replica is reachable"
+            description: "Prometheus can't scrape any controller replica, so nothing is remediating pods."
+
+        - alert: AegisNoLeader
+          expr: sum(aegis_leader) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "aegis-controller has no active leader"
+            description: "Replicas are running but none holds the Lease, so nothing is remediating pods."
+
+        - alert: AegisSplitBrain
+          expr: sum(aegis_leader) > 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "{{ $value }} aegis-controller replicas think they are leader"
+            description: "More than one replica is remediating; the same pod may be deleted twice."
+
+        # Many deletions in a short window usually means a bad release or a
+        # cluster-wide problem, which deleting pods won't fix.
+        - alert: AegisRemediationSpike
+          expr: sum(increase(aegis_crashloop_deletions_total[10m])) + sum(increase(aegis_pending_deletions_total[10m])) > 5
+          labels:
+            severity: warning
+          annotations:
+            summary: "aegis-controller remediated {{ $value | humanize }} pods in 10 minutes"
+            description: "Check recent rollouts and node health; repeated deletions may be hiding a systemic failure."

@@ -1,0 +1,138 @@
+# promtool unit tests for manifests/prometheus-rules.yaml.
+# rules.generated.yaml is the PrometheusRule's .spec, extracted before the run:
+#   yq '.spec' manifests/prometheus-rules.yaml > tests/prometheus/rules.generated.yaml
+#   promtool test rules tests/prometheus/rules.test.yaml
+rule_files:
+  - rules.generated.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # The bug this rule used to have: a pod that restarted long ago keeps a
+  # high lifetime count and must not alert. A pod restarting now must.
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="aegis-workloads", pod="old-restarts", container="app"}'
+        values: '18x30'
+      - series: 'kube_pod_container_status_restarts_total{namespace="aegis-workloads", pod="crashing", container="app"}'
+        values: '0+1x30'
+      - series: 'kube_pod_container_status_restarts_total{namespace="aegis-workloads", pod="one-restart", container="app"}'
+        values: '0x10 1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: aegis-workloads
+              pod: crashing
+              container: app
+            exp_annotations:
+              summary: "Pod aegis-workloads/crashing is crash looping"
+              description: "Container app restarted 15 times in the last 15 minutes."
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="aegis-controller-metrics", pod="a"}'
+        values: '1x3 0x10'
+      - series: 'up{job="aegis-controller-metrics", pod="b"}'
+        values: '1x3 0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AegisControllerDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: AegisControllerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No aegis-controller replica is reachable"
+              description: "Prometheus can't scrape any controller replica, so nothing is remediating pods."
+
+  # Never scraped at all (e.g. ServiceMonitor missing) is also "down".
+  - interval: 1m
+    input_series:
+      - series: 'up{job="something-else"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AegisControllerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: aegis-controller-metrics
+            exp_annotations:
+              summary: "No aegis-controller replica is reachable"
+              description: "Prometheus can't scrape any controller replica, so nothing is remediating pods."
+
+  - interval: 1m
+    input_series:
+      - series: 'aegis_leader{pod="a"}'
+        values: '1x2 0x10'
+      - series: 'aegis_leader{pod="b"}'
+        values: '0x3 1x10'
+    alert_rule_test:
+      # One leader: healthy.
+      - eval_time: 1m
+        alertname: AegisNoLeader
+        exp_alerts: []
+      # Leader stepped down at 3m and the standby took over at 4m. A real
+      # handover takes seconds; the 2m "for" keeps it from paging anyone.
+      - eval_time: 5m
+        alertname: AegisNoLeader
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'aegis_leader{pod="a"}'
+        values: '0x10'
+      - series: 'aegis_leader{pod="b"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AegisNoLeader
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "aegis-controller has no active leader"
+              description: "Replicas are running but none holds the Lease, so nothing is remediating pods."
+
+  - interval: 1m
+    input_series:
+      - series: 'aegis_leader{pod="a"}'
+        values: '1x10'
+      - series: 'aegis_leader{pod="b"}'
+        values: '0x2 1x8'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AegisSplitBrain
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AegisSplitBrain
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "2 aegis-controller replicas think they are leader"
+              description: "More than one replica is remediating; the same pod may be deleted twice."
+
+  - interval: 1m
+    input_series:
+      - series: 'aegis_crashloop_deletions_total{pod="a"}'
+        values: '0x5 0+2x10'
+      - series: 'aegis_pending_deletions_total{pod="a"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AegisRemediationSpike
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: AegisRemediationSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "aegis-controller remediated 12 pods in 10 minutes"
+              description: "Check recent rollouts and node health; repeated deletions may be hiding a systemic failure."
