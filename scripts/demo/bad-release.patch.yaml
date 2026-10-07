@@ -1,0 +1,19 @@
+# Demo: a release that fails about a third of its requests, to show the
+# canary analysis aborting it. A merge patch replaces the whole container
+# list, so the container is repeated in full with the error injector on.
+#
+#   kubectl patch rollout demo-app -n aegis-workloads --type merge --patch-file scripts\demo\bad-release.patch.yaml
+#
+# Restore with: kubectl apply -f manifests\rollouts\canary-app.yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: demo-app
+          image: stefanprodan/podinfo:6.7.1
+          ports:
+            - name: http
+              containerPort: 9898
+          env:
+            - name: PODINFO_RANDOM_ERROR
+              value: "true"

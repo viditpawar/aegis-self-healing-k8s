@@ -4,6 +4,13 @@ metadata:
   name: success-rate
   namespace: aegis-workloads
 spec:
+  args:
+    # The canary ReplicaSet's pod-template-hash, passed in by the Rollout.
+    # Argo names canary pods demo-app-<hash>-<suffix>, so matching on it
+    # measures only the canary. Mixing in the stable pods' traffic would
+    # dilute the canary's errors: at 25% weight a canary failing 15% of
+    # requests would still look ~96% healthy overall.
+    - name: canary-hash
   metrics:
     - name: success-rate
       initialDelay: 60s
@@ -14,5 +21,5 @@ spec:
         prometheus:
           address: http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090
           query: |
-            sum(rate(http_requests_total{status!~"5.."}[1m])) /
-            sum(rate(http_requests_total[1m]))
+            sum(rate(http_requests_total{namespace="aegis-workloads", service="demo-app", pod=~"demo-app-{{args.canary-hash}}-.*", status!~"5.."}[1m])) /
+            sum(rate(http_requests_total{namespace="aegis-workloads", service="demo-app", pod=~"demo-app-{{args.canary-hash}}-.*"}[1m]))
