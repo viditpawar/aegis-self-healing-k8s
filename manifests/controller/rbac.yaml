@@ -28,3 +28,29 @@ roleRef:
   kind: ClusterRole
   name: aegis-controller-role
   apiGroup: rbac.authorization.k8s.io
+---
+# Leader election: replicas compete for a Lease in their own namespace, so
+# this stays a namespaced Role rather than widening the ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aegis-controller-leader-election
+  namespace: aegis-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aegis-controller-leader-election
+  namespace: aegis-system
+subjects:
+  - kind: ServiceAccount
+    name: aegis-controller
+    namespace: aegis-system
+roleRef:
+  kind: Role
+  name: aegis-controller-leader-election
+  apiGroup: rbac.authorization.k8s.io

@@ -22,7 +22,7 @@ cluster.
 flowchart TB
     subgraph cluster["Kubernetes cluster — kind, EKS, or AKS"]
         subgraph ns_system["namespace: aegis-system  (PSS: restricted)"]
-            controller["aegis-controller\nclient-go informers · pure remediate/ package\n:8080/metrics"]
+            controller["aegis-controller × 2\nLease-based leader election · client-go informers\n:8080/metrics"]
             discordAdapter["alertmanager-discord\nadapter"]
         end
 
@@ -74,7 +74,13 @@ flowchart TB
   `aegis_pending_deletions_total`, exposed on `:8080/metrics` and scraped via
   a `ServiceMonitor`). Every deletion also records a Kubernetes `Warning`
   Event (`CrashLoopRemediated` / `PendingRemediated`) so `kubectl get events`
-  shows why a pod disappeared. The pod itself runs as non-root with all capabilities
+  shows why a pod disappeared. Two replicas run for availability, but only
+  the one holding the `aegis-controller` Lease in `aegis-system` remediates
+  (`controller/pkg/leader`); the standby takes over within seconds if the
+  leader is deleted, and within ~15s if it dies without releasing the Lease.
+  A replica that loses leadership exits and restarts rather than risk acting
+  as a second leader. The `aegis_leader` gauge shows which replica is active.
+  The pod itself runs as non-root with all capabilities
   dropped, satisfying the `restricted` Pod Security Standard enforced on
   `aegis-system`.
 - **`monitoring`** — `kube-prometheus-stack` (Prometheus, Alertmanager,
@@ -122,6 +128,22 @@ flowchart TB
 
 ## Running locally (kind)
 
+### One command
+
+```powershell
+.\scripts\up.ps1                                   # everything except Discord
+.\scripts\up.ps1 -DiscordWebhookUrl <webhook-url>  # plus Discord alerting
+```
+
+`scripts/up.ps1` runs every step below in order and is safe to re-run: it
+reuses an existing cluster, upgrades Helm releases in place, and re-applies
+manifests. Chart and Argo Rollouts versions are pinned
+(kube-prometheus-stack `88.3.0`, Argo Rollouts `v1.9.1`), and every command
+targets the `kind-aegis` context, so your current kubectl context is left
+alone. `scripts/down.ps1` deletes the cluster.
+
+### Step by step
+
 ```powershell
 # 1. Create the cluster
 kind create cluster --config kind\cluster-config.yaml
@@ -133,7 +155,7 @@ kubectl apply -f manifests\namespaces.yaml
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 helm install monitoring prometheus-community/kube-prometheus-stack `
-  --namespace monitoring `
+  --namespace monitoring --version 88.3.0 `
   --set grafana.enabled=true `
   --set prometheus.prometheusSpec.retention=6h
 kubectl apply -f manifests\prometheus-rules.yaml
@@ -154,14 +176,14 @@ kubectl create secret generic discord-webhook -n aegis-system `
   --from-literal=DISCORD_WEBHOOK_URL=<your-webhook-url>
 kubectl apply -f manifests\monitoring\alertmanager-discord.yaml
 helm upgrade monitoring prometheus-community/kube-prometheus-stack `
-  --namespace monitoring `
+  --namespace monitoring --version 88.3.0 `
   --set grafana.enabled=true `
   --set prometheus.prometheusSpec.retention=6h `
   -f manifests\monitoring\alertmanager-values.yaml
 
 # 7. Argo Rollouts
 kubectl create namespace argo-rollouts
-kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/download/v1.9.1/install.yaml
 kubectl apply -f manifests\rollouts\canary-app.yaml
 kubectl apply -f manifests\rollouts\analysis-template.yaml
 kubectl apply -f manifests\rollouts\demo-app-servicemonitor.yaml
@@ -246,6 +268,8 @@ at startup instead of silently falling back to defaults.
 | `AEGIS_NAMESPACE` | `aegis-workloads` | Namespace to watch and remediate |
 | `AEGIS_MAX_RESTARTS` | `5` | Delete a `CrashLoopBackOff` pod once restarts exceed this |
 | `AEGIS_PENDING_TIMEOUT` | `5m` | Delete a pod stuck `Pending` longer than this (Go duration: `90s`, `10m`) |
+| `AEGIS_LEADER_ELECTION` | `false` | Compete for a Lease so only one replica remediates; the manifest sets `true` |
+| `POD_NAME` / `POD_NAMESPACE` | — | Required when leader election is on; set from the downward API |
 
 If you change `AEGIS_NAMESPACE`, the existing RBAC still works (it's a
 `ClusterRole`), but the namespace's Pod Security and NetworkPolicy setup is
@@ -264,6 +288,18 @@ aegis-workloads --field-selector reason=CrashLoopRemediated` will show the
 remediation Event, and (if Discord alerting is
 configured) a `PodCrashLooping` message will land in your channel within a
 couple of minutes.
+
+## Verifying leader election
+
+```powershell
+kubectl get lease aegis-controller -n aegis-system -o jsonpath='{.spec.holderIdentity}'
+kubectl delete pod -n aegis-system <that pod name>
+kubectl get lease aegis-controller -n aegis-system -o jsonpath='{.spec.holderIdentity}'
+```
+
+The second command's output should name the other replica within a few
+seconds, and its log will show `acquired leadership`. The Grafana "Active
+Leader" panel (`sum(aegis_leader)`) should stay at 1 throughout.
 
 ## Verifying the canary
 
@@ -288,6 +324,7 @@ run traffic-gen --image=busybox -n aegis-workloads --restart=Always -- sh -c
 controller/
   cmd/main.go                    wiring only: build client, handle SIGTERM, start controller
   pkg/config/                    env-var configuration with validation
+  pkg/leader/                    Lease-based leader election wrapper + failover tests
   pkg/controller/                informer + Pending sweep + dedup + Events; tested with a fake clientset
   pkg/remediate/                 pure decision functions + table-driven tests
   pkg/k8sclient/                 in-cluster clientset construction
@@ -300,11 +337,12 @@ manifests/
   rollouts/                      Argo Rollouts canary (podinfo) + AnalysisTemplate + ServiceMonitor
   networkpolicy/                 default-deny-ingress + scoped allow rules
 kind/cluster-config.yaml         local 3-node kind cluster
+scripts/up.ps1, down.ps1         one-command local bring-up / teardown
 .github/workflows/               CI: gofmt/tidy/vet/race tests on PRs; build + push image to GHCR on main
 ```
 
 ## Teardown (kind)
 
 ```powershell
-kind delete cluster --name aegis
+.\scripts\down.ps1    # or: kind delete cluster --name aegis
 ```

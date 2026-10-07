@@ -24,6 +24,11 @@ var (
 		Name: "aegis_pending_deletions_total",
 		Help: "Total number of pods deleted for being stuck Pending.",
 	})
+
+	IsLeader = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "aegis_leader",
+		Help: "1 if this replica is the active (remediating) controller, 0 if it's on standby.",
+	})
 )
 
 // Handler returns the mux serving /metrics and the /healthz probe endpoint.

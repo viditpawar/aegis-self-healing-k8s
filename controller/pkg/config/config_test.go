@@ -39,6 +39,28 @@ func TestLoad(t *testing.T) {
 		{name: "negative restarts", env: map[string]string{EnvMaxRestarts: "-1"}, wantErr: true},
 		{name: "unitless timeout", env: map[string]string{EnvPendingTimeout: "300"}, wantErr: true},
 		{name: "zero timeout", env: map[string]string{EnvPendingTimeout: "0s"}, wantErr: true},
+		{
+			name: "leader election with pod identity",
+			env: map[string]string{
+				EnvLeaderElection: "true",
+				EnvPodName:        "aegis-controller-abc",
+				EnvPodNamespace:   "aegis-system",
+			},
+			want: Config{
+				Namespace:      DefaultNamespace,
+				Policy:         remediate.DefaultPolicy(),
+				LeaderElection: true,
+				Identity:       "aegis-controller-abc",
+				LeaseNamespace: "aegis-system",
+			},
+		},
+		{
+			name: "pod identity ignored when leader election is off",
+			env:  map[string]string{EnvPodName: "x", EnvPodNamespace: "y"},
+			want: Config{Namespace: DefaultNamespace, Policy: remediate.DefaultPolicy()},
+		},
+		{name: "leader election without pod name", env: map[string]string{EnvLeaderElection: "true", EnvPodNamespace: "aegis-system"}, wantErr: true},
+		{name: "leader election not a bool", env: map[string]string{EnvLeaderElection: "yes please"}, wantErr: true},
 	}
 
 	for _, tc := range cases {

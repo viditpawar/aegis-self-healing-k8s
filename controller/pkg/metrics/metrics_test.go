@@ -19,6 +19,7 @@ func TestHandler(t *testing.T) {
 		{"/healthz", "ok"},
 		{"/metrics", "aegis_crashloop_deletions_total"},
 		{"/metrics", "aegis_pending_deletions_total"},
+		{"/metrics", "aegis_leader"},
 	}
 
 	for _, tc := range cases {

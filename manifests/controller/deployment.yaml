@@ -4,7 +4,9 @@ metadata:
   name: aegis-controller
   namespace: aegis-system
 spec:
-  replicas: 1
+  # Two replicas for availability; leader election makes only one of them
+  # remediate at a time, and the standby takes over within ~15s.
+  replicas: 2
   selector:
     matchLabels:
       app: aegis-controller
@@ -29,6 +31,16 @@ spec:
               value: "5"
             - name: AEGIS_PENDING_TIMEOUT
               value: 5m
+            - name: AEGIS_LEADER_ELECTION
+              value: "true"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 8080

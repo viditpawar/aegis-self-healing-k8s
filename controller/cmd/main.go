@@ -15,6 +15,7 @@ import (
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/config"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/controller"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/k8sclient"
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/leader"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/metrics"
 )
 
@@ -48,7 +49,17 @@ func main() {
 		CrashLoop: metrics.CrashLoopDeletions,
 		Pending:   metrics.PendingDeletions,
 	})
-	if err := c.Run(ctx); err != nil {
+
+	if cfg.LeaderElection {
+		log.Printf("leader election enabled, competing for Lease %s/%s as %s",
+			cfg.LeaseNamespace, leader.LeaseName, cfg.Identity)
+		err = leader.Run(ctx, clientset, cfg.LeaseNamespace, cfg.Identity,
+			leader.DefaultTimings, metrics.IsLeader, c.Run)
+	} else {
+		metrics.IsLeader.Set(1)
+		err = c.Run(ctx)
+	}
+	if err != nil {
 		log.Fatalf("controller stopped: %v", err)
 	}
 	log.Println("Aegis controller shut down")

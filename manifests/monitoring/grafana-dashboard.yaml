@@ -37,7 +37,7 @@ data:
             "textMode": "auto"
           },
           "targets": [
-            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aegis_crashloop_deletions_total", "refId": "A" }
+            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(aegis_crashloop_deletions_total)", "refId": "A" }
           ],
           "title": "CrashLoopBackOff Pods Remediated",
           "type": "stat"
@@ -63,7 +63,7 @@ data:
             "textMode": "auto"
           },
           "targets": [
-            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "aegis_pending_deletions_total", "refId": "A" }
+            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(aegis_pending_deletions_total)", "refId": "A" }
           ],
           "title": "Pending Pods Remediated",
           "type": "stat"
@@ -74,11 +74,11 @@ data:
             "defaults": {
               "color": { "mode": "thresholds" },
               "mappings": [
-                { "options": { "0": { "text": "Down" }, "1": { "text": "Up" } }, "type": "value" }
+                { "options": { "0": { "text": "No leader" }, "1": { "text": "1 leader" }, "2": { "text": "Split brain" } }, "type": "value" }
               ],
               "thresholds": {
                 "mode": "absolute",
-                "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }]
+                "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }, { "color": "red", "value": 2 }]
               }
             },
             "overrides": []
@@ -94,9 +94,9 @@ data:
             "textMode": "auto"
           },
           "targets": [
-            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "up{job=\"aegis-controller-metrics\"}", "refId": "A" }
+            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(aegis_leader)", "refId": "A" }
           ],
-          "title": "Controller Status",
+          "title": "Active Leader",
           "type": "stat"
         },
         {
@@ -135,8 +135,8 @@ data:
             "tooltip": { "mode": "multi", "sort": "none" }
           },
           "targets": [
-            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(aegis_crashloop_deletions_total[5m])", "legendFormat": "CrashLoopBackOff deletions/sec", "refId": "A" },
-            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(aegis_pending_deletions_total[5m])", "legendFormat": "Pending deletions/sec", "refId": "B" }
+            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aegis_crashloop_deletions_total[5m]))", "legendFormat": "CrashLoopBackOff deletions/sec", "refId": "A" },
+            { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(aegis_pending_deletions_total[5m]))", "legendFormat": "Pending deletions/sec", "refId": "B" }
           ],
           "title": "Remediation Rate",
           "type": "timeseries"

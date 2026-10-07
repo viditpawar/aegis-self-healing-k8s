@@ -14,6 +14,11 @@ const (
 	EnvNamespace      = "AEGIS_NAMESPACE"
 	EnvMaxRestarts    = "AEGIS_MAX_RESTARTS"
 	EnvPendingTimeout = "AEGIS_PENDING_TIMEOUT"
+	EnvLeaderElection = "AEGIS_LEADER_ELECTION"
+
+	// Set from the downward API; required when leader election is on.
+	EnvPodName      = "POD_NAME"
+	EnvPodNamespace = "POD_NAMESPACE"
 
 	DefaultNamespace = "aegis-workloads"
 )
@@ -22,6 +27,12 @@ const (
 type Config struct {
 	Namespace string
 	Policy    remediate.Policy
+
+	// LeaderElection makes replicas compete for a Lease in LeaseNamespace,
+	// identifying themselves as Identity; only the leader remediates.
+	LeaderElection bool
+	Identity       string
+	LeaseNamespace string
 }
 
 // Load builds a Config from getenv (os.Getenv in production). Invalid
@@ -51,6 +62,22 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be a positive duration like 5m, got %q", EnvPendingTimeout, v)
 		}
 		cfg.Policy.PendingTimeout = d
+	}
+
+	if v := getenv(EnvLeaderElection); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false, got %q", EnvLeaderElection, v)
+		}
+		cfg.LeaderElection = on
+	}
+	if cfg.LeaderElection {
+		cfg.Identity = getenv(EnvPodName)
+		cfg.LeaseNamespace = getenv(EnvPodNamespace)
+		if cfg.Identity == "" || cfg.LeaseNamespace == "" {
+			return Config{}, fmt.Errorf("%s=true requires %s and %s (set them from the downward API)",
+				EnvLeaderElection, EnvPodName, EnvPodNamespace)
+		}
 	}
 
 	return cfg, nil
