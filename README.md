@@ -103,10 +103,13 @@ flowchart TB
   many kind setups, **this cluster's CNI (kindnet, kind v0.32.0+) actually
   enforces NetworkPolicy** — see
   [NetworkPolicy enforcement](#networkpolicy-enforcement) below.
-- **CI/CD** — `.github/workflows/build.yaml` builds and pushes the controller
-  image to `ghcr.io/viditpawar/aegis-self-healing-k8s-controller` on every
-  push to `controller/**`, using the repo's built-in `GITHUB_TOKEN` — no
-  cloud credentials needed.
+- **CI/CD** — `.github/workflows/build.yaml` runs `gofmt`, a `go mod tidy`
+  check, `go vet`, and `go test -race` on every PR and push touching
+  `controller/**`. PRs also build the image (without pushing) to prove the
+  Dockerfile works; pushes to `main` publish it to
+  `ghcr.io/viditpawar/aegis-self-healing-k8s-controller` as `:latest` and
+  `:sha-<commit>`, using the repo's built-in `GITHUB_TOKEN` — no cloud
+  credentials needed.
 
 ## Prerequisites
 
@@ -262,10 +265,11 @@ run traffic-gen --image=busybox -n aegis-workloads --restart=Always -- sh -c
 
 ```
 controller/
-  cmd/main.go                    wiring only: build client, run informer, call remediate
+  cmd/main.go                    wiring only: build client, handle SIGTERM, start controller
+  pkg/controller/                informer + Pending sweep + dedup; tested with a fake clientset
   pkg/remediate/                 pure decision functions + table-driven tests
   pkg/k8sclient/                 in-cluster clientset construction
-  pkg/metrics/                   Prometheus counters, /metrics endpoint
+  pkg/metrics/                   Prometheus counters, /metrics and /healthz endpoints
 manifests/
   namespaces.yaml                aegis-system / aegis-workloads / monitoring
   prometheus-rules.yaml          PodCrashLooping alert rule
@@ -274,7 +278,7 @@ manifests/
   rollouts/                      Argo Rollouts canary (podinfo) + AnalysisTemplate + ServiceMonitor
   networkpolicy/                 default-deny-ingress + scoped allow rules
 kind/cluster-config.yaml         local 3-node kind cluster
-.github/workflows/               CI: build + push controller image to GHCR
+.github/workflows/               CI: gofmt/tidy/vet/race tests on PRs; build + push image to GHCR on main
 ```
 
 ## Teardown (kind)

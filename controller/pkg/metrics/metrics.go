@@ -3,8 +3,11 @@
 package metrics
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -23,14 +26,36 @@ var (
 	})
 )
 
-// Serve starts an HTTP server exposing the /metrics endpoint on addr. It
-// blocks, so callers should run it in its own goroutine.
-func Serve(addr string) {
+// Handler returns the mux serving /metrics and the /healthz probe endpoint.
+func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	return mux
+}
+
+// Serve starts an HTTP server exposing Handler on addr, and shuts it down
+// when ctx is cancelled. It blocks, so callers should run it in its own
+// goroutine.
+func Serve(ctx context.Context, addr string) {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("metrics server listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("metrics server error: %v", err)
 	}
 }

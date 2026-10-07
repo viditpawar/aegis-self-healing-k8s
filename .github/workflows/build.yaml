@@ -5,9 +5,47 @@ on:
     branches: [main]
     paths:
       - 'controller/**'
+      - '.github/workflows/build.yaml'
+  pull_request:
+    paths:
+      - 'controller/**'
+      - '.github/workflows/build.yaml'
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: controller
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -15,25 +53,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-
-      - name: Run tests
-        working-directory: controller
-        run: go test ./...
-
       - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # PRs only prove the image builds; pushes to main publish it.
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: ./controller
-          push: true
-          tags: ghcr.io/viditpawar/aegis-self-healing-k8s-controller:latest
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ghcr.io/viditpawar/aegis-self-healing-k8s-controller:latest
+            ghcr.io/viditpawar/aegis-self-healing-k8s-controller:sha-${{ github.sha }}
