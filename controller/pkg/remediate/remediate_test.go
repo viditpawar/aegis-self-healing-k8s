@@ -133,3 +133,37 @@ func TestPolicyThresholdsAreConfigurable(t *testing.T) {
 		t.Error("default policy should keep a pod Pending for 1 minute")
 	}
 }
+
+func TestOptOutAnnotation(t *testing.T) {
+	now := time.Now()
+	optedOut := metav1.ObjectMeta{
+		Annotations:       map[string]string{OptOutAnnotation: "false"},
+		CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+	}
+
+	crashing := corev1.Pod{
+		ObjectMeta: optedOut,
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				RestartCount: 50,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				},
+			}},
+		},
+	}
+	if got, _ := DefaultPolicy().CrashLoopDecision(crashing); got {
+		t.Error("opted-out crash-looping pod should be kept")
+	}
+
+	pending := corev1.Pod{ObjectMeta: optedOut, Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	if got, _ := DefaultPolicy().PendingDecision(pending, now); got {
+		t.Error("opted-out Pending pod should be kept")
+	}
+
+	// Any other value, including "true", leaves remediation on.
+	crashing.Annotations = map[string]string{OptOutAnnotation: "true"}
+	if got, _ := DefaultPolicy().CrashLoopDecision(crashing); !got {
+		t.Error(`annotation "true" should not opt out`)
+	}
+}

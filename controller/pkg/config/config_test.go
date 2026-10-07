@@ -11,6 +11,14 @@ func envFrom(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
+func defaults() Config {
+	return Config{
+		Namespace:             DefaultNamespace,
+		Policy:                remediate.DefaultPolicy(),
+		MaxDeletionsPerMinute: DefaultMaxDeletionsPerMinute,
+	}
+}
+
 func TestLoad(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -21,7 +29,7 @@ func TestLoad(t *testing.T) {
 		{
 			name: "defaults when unset",
 			env:  map[string]string{},
-			want: Config{Namespace: DefaultNamespace, Policy: remediate.DefaultPolicy()},
+			want: defaults(),
 		},
 		{
 			name: "all overridden",
@@ -29,12 +37,16 @@ func TestLoad(t *testing.T) {
 				EnvNamespace:      "team-a",
 				EnvMaxRestarts:    "3",
 				EnvPendingTimeout: "90s",
+				EnvMaxDeletions:   "0",
 			},
 			want: Config{
-				Namespace: "team-a",
-				Policy:    remediate.Policy{MaxRestarts: 3, PendingTimeout: 90 * time.Second},
+				Namespace:             "team-a",
+				Policy:                remediate.Policy{MaxRestarts: 3, PendingTimeout: 90 * time.Second},
+				MaxDeletionsPerMinute: 0,
 			},
 		},
+		{name: "negative deletion limit", env: map[string]string{EnvMaxDeletions: "-5"}, wantErr: true},
+		{name: "non-numeric deletion limit", env: map[string]string{EnvMaxDeletions: "lots"}, wantErr: true},
 		{name: "non-numeric restarts", env: map[string]string{EnvMaxRestarts: "five"}, wantErr: true},
 		{name: "negative restarts", env: map[string]string{EnvMaxRestarts: "-1"}, wantErr: true},
 		{name: "unitless timeout", env: map[string]string{EnvPendingTimeout: "300"}, wantErr: true},
@@ -46,18 +58,18 @@ func TestLoad(t *testing.T) {
 				EnvPodName:        "aegis-controller-abc",
 				EnvPodNamespace:   "aegis-system",
 			},
-			want: Config{
-				Namespace:      DefaultNamespace,
-				Policy:         remediate.DefaultPolicy(),
-				LeaderElection: true,
-				Identity:       "aegis-controller-abc",
-				LeaseNamespace: "aegis-system",
-			},
+			want: func() Config {
+				c := defaults()
+				c.LeaderElection = true
+				c.Identity = "aegis-controller-abc"
+				c.LeaseNamespace = "aegis-system"
+				return c
+			}(),
 		},
 		{
 			name: "pod identity ignored when leader election is off",
 			env:  map[string]string{EnvPodName: "x", EnvPodNamespace: "y"},
-			want: Config{Namespace: DefaultNamespace, Policy: remediate.DefaultPolicy()},
+			want: defaults(),
 		},
 		{name: "leader election without pod name", env: map[string]string{EnvLeaderElection: "true", EnvPodNamespace: "aegis-system"}, wantErr: true},
 		{name: "leader election not a bool", env: map[string]string{EnvLeaderElection: "yes please"}, wantErr: true},

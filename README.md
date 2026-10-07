@@ -89,8 +89,10 @@ How the controller works:
    than 5 minutes. Both thresholds are configurable.
 4. **Sweep what informers can't see.** A pod sitting idle in `Pending` never produces an
    event, so a 30-second ticker lists the namespace and catches those.
-5. **Act once.** Deletes are deduplicated by pod UID, so a resync racing a real update
-   can't delete or count the same pod twice.
+5. **Act once, and not too often.** Deletes are deduplicated by pod UID, so a resync racing
+   a real update can't delete or count the same pod twice. A rate limit (10 per minute by
+   default) stops a bad release from turning into a wave of deletions, and pods annotated
+   `aegis/remediate: "false"` are never touched.
 6. **Leave a trail.** Each deletion increments a Prometheus counter and records a `Warning`
    Event on the pod with the reason.
 7. **Fail safe.** On SIGTERM the leader stops, releases the Lease and the standby takes over
@@ -102,16 +104,18 @@ How the controller works:
 - Event-driven remediation of `CrashLoopBackOff` and stuck-`Pending` pods using client-go informers
 - Highly available: 2 replicas, Lease-based leader election, ~2s failover on graceful shutdown, about 15s after a crash
 - Exactly-once remediation per pod, enforced by UID deduplication and verified on a live cluster
+- Guardrails: a deletion rate limit, and an `aegis/remediate: "false"` opt-out annotation for pods you're debugging
 - Kubernetes Events (`CrashLoopRemediated`, `PendingRemediated`) so `kubectl get events` explains every deletion
 - Thresholds and target namespace configured by environment variables, validated at startup
 - Prometheus metrics, `/healthz` liveness and readiness probes, graceful shutdown on SIGTERM
 - Grafana dashboard for remediations, remediation rate, and active-leader count
-- `PodCrashLooping` alert routed to Discord, with everything else on a `null` receiver to keep the channel quiet
-- Argo Rollouts canary for a demo app, promoted only if live success rate stays ≥ 95%
+- Alerts for crash-looping pods and for the controller itself (down, no leader, split brain, remediation spike), routed to Discord and unit tested with `promtool`
+- Argo Rollouts canary that measures **only the canary's pods** and is promoted only if their success rate stays ≥ 95%. Verified: a release returning ~20% errors was aborted
 - Pod Security Standards per namespace (`restricted` for the controller) and default-deny NetworkPolicy
 - Hardened image: multi-stage build, distroless, non-root, all capabilities dropped
 - One-command local setup that is safe to re-run, with pinned chart and Argo Rollouts versions
 - Unit tests for every package, including the controller against a fake clientset and leader failover
+- CI validates every manifest against its schema (including Argo and Prometheus Operator CRDs) and unit tests the alert rules
 
 ## Design notes
 
@@ -127,6 +131,9 @@ Most of the design came from problems that only showed up on a real cluster.
 | A typo in a threshold (`five`, `300` without a unit) would silently fall back to a default | Configuration is validated at startup and the controller refuses to start |
 | kindnet in kind v0.32.0 **enforces** NetworkPolicy, so default-deny silently dropped Prometheus scrapes and canary traffic | An explicit allow rule for `monitoring` → `demo-app`. See [Security](#security) |
 | Argo Rollouts' Prometheus provider returns `[]float64`, so `result >= 0.95` never matched | `successCondition: result[0] >= 0.95` |
+| The canary analysis measured every `http_requests_total` in the cluster, so healthy stable pods diluted the canary's errors. A release returning ~20% errors scored **95.65%** and would have been promoted | The Rollout passes the canary's pod-template-hash into the `AnalysisTemplate`, and the query matches only `demo-app-<hash>-*` pods. The same release scored **80.43%** and was aborted |
+| `PodCrashLooping` used the lifetime restart count (`> 5`), which never resets. After a few cluster restarts it was firing for **29 healthy pods**, all routed to Discord | It now fires on `increase(...[15m]) > 3`, i.e. restarting *now*. A `promtool` test pins the case of a pod with 18 old restarts |
+| A bad release can crash-loop dozens of pods at once, and deleting them all helps nothing | Deletions are rate limited, throttled pods are retried later, and `AegisRemediationSpike` alerts a human |
 | node-exporter needs `hostNetwork`, `hostPID` and `hostPath`, which `restricted` and `baseline` block | Monitoring lives in its own `privileged` namespace, keeping `aegis-system` at `restricted` |
 | kube-prometheus-stack alerts that are false positives on kind (single-node etcd, kube-proxy) flooded Discord | Alertmanager routes only `PodCrashLooping` to Discord; everything else goes to a `null` receiver |
 | Two replicas exporting counters doubled every dashboard series | Dashboard queries use `sum()`, and an "Active Leader" panel shows `sum(aegis_leader)`: 1 healthy, 0 no leader, 2 split brain |
@@ -165,11 +172,13 @@ aegis-self-healing-k8s/
 │   ├── monitoring/                 # Discord adapter, Alertmanager values, Grafana dashboard
 │   ├── rollouts/                   # demo-app Rollout, AnalysisTemplate, ServiceMonitor
 │   └── networkpolicy/              # default-deny ingress + scoped allow rule
+├── tests/prometheus/               # promtool unit tests for the alert rules
 ├── kind/cluster-config.yaml        # 1 control plane + 2 workers
 ├── scripts/
 │   ├── up.ps1                      # one-command local setup, safe to re-run
-│   └── down.ps1                    # delete the local cluster
-└── .github/workflows/build.yaml    # format, tidy, vet, race tests, image build and publish
+│   ├── down.ps1                    # delete the local cluster
+│   └── demo/bad-release.patch.yaml # a release that fails ~1/3 of requests, for the canary demo
+└── .github/workflows/build.yaml    # Go checks, manifest validation, rule tests, image publish
 ```
 
 ## Quick start
@@ -272,8 +281,15 @@ value stops the controller at startup rather than falling back to a default.
 | `AEGIS_NAMESPACE` | `aegis-workloads` | Namespace to watch and remediate |
 | `AEGIS_MAX_RESTARTS` | `5` | Delete a `CrashLoopBackOff` pod once its restart count exceeds this |
 | `AEGIS_PENDING_TIMEOUT` | `5m` | Delete a pod `Pending` for longer than this (Go duration, such as `90s` or `10m`) |
+| `AEGIS_MAX_DELETIONS_PER_MINUTE` | `10` | Cap on deletions per minute. Throttled pods are retried on the next resync. `0` disables the cap |
 | `AEGIS_LEADER_ELECTION` | `false` | Compete for a Lease so only one replica remediates. The manifest sets `true` |
 | `POD_NAME`, `POD_NAMESPACE` | none | Required when leader election is on. Set from the downward API in the manifest |
+
+To exempt a single pod, for example while debugging it by hand, annotate it:
+
+```powershell
+kubectl annotate pod <name> -n aegis-workloads aegis/remediate=false
+```
 
 The ClusterRole lets the controller work in any namespace you point it at, but that
 namespace's Pod Security and NetworkPolicy setup is up to you.
@@ -318,7 +334,8 @@ kubectl get lease aegis-controller -n aegis-system -o jsonpath="{.spec.holderIde
 The standby takes over in about 2 seconds and logs `acquired leadership`. The Grafana
 "Active Leader" panel stays at 1.
 
-**3. Gated canary.** Generate traffic so the analysis has data, then roll out a new version:
+**3. Gated canary, good release.** Generate traffic so the analysis has data, then roll
+out a new version:
 
 ```powershell
 kubectl run traffic-gen --image=busybox -n aegis-workloads --restart=Always -- `
@@ -333,7 +350,25 @@ an `AnalysisRun` that measures the success rate 5 times, 30 seconds apart. It co
 50% and 100% only if every measurement is ≥ 0.95. Check it with
 `kubectl get analysisrun -n aegis-workloads`.
 
-**4. Clean up:** `kubectl delete pod traffic-gen -n aegis-workloads`.
+**4. Gated canary, bad release.** podinfo can inject errors into about a third of its
+responses. Roll out a version with that turned on:
+
+```powershell
+kubectl patch rollout demo-app -n aegis-workloads --type merge --patch-file scripts\demo\bad-release.patch.yaml
+kubectl get rollout demo-app -n aegis-workloads -w
+```
+
+The first measurement fails and Argo aborts:
+
+```text
+RolloutAborted: Rollout aborted update to revision 13: Step-based analysis phase error/failed:
+Metric "success-rate" assessed Failed due to failed (1) > failureLimit (0)
+```
+
+The canary is scaled to zero and all traffic stays on the stable version. Restore it with
+`kubectl apply -f manifests\rollouts\canary-app.yaml`.
+
+**5. Clean up:** `kubectl delete pod traffic-gen -n aegis-workloads`.
 
 ## Observability
 
@@ -345,6 +380,7 @@ Exposed by each controller replica on `:8080/metrics` and scraped through a Serv
 |---|---|---|
 | `aegis_crashloop_deletions_total` | counter | How many crash-looping pods were remediated |
 | `aegis_pending_deletions_total` | counter | How many stuck-Pending pods were remediated |
+| `aegis_remediations_throttled_total` | counter | How many remediations were postponed by the rate limit |
 | `aegis_leader` | gauge | Whether this replica is the active leader (1) or on standby (0) |
 
 ### Kubernetes Events
@@ -353,6 +389,7 @@ Exposed by each controller replica on `:8080/metrics` and scraped through a Serv
 |---|---|---|
 | `CrashLoopRemediated` | Warning | A pod was deleted for exceeding `AEGIS_MAX_RESTARTS` in `CrashLoopBackOff` |
 | `PendingRemediated` | Warning | A pod was deleted for staying `Pending` past `AEGIS_PENDING_TIMEOUT` |
+| `RemediationThrottled` | Warning | A remediation was postponed because `AEGIS_MAX_DELETIONS_PER_MINUTE` was reached |
 
 ### Dashboard
 
@@ -363,9 +400,24 @@ time, and the number of active leaders (1 is healthy, 0 means no replica is reme
 
 ### Alerts
 
-| Alert | Severity | Fires when | Routed to |
-|---|---|---|---|
-| `PodCrashLooping` | warning | A container's restart count is above 5 for 2 minutes | Discord |
+Defined in [`manifests/prometheus-rules.yaml`](manifests/prometheus-rules.yaml), unit tested
+in [`tests/prometheus/rules.test.yaml`](tests/prometheus/rules.test.yaml), and routed to
+Discord. Every other kube-prometheus-stack alert goes to a `null` receiver.
+
+| Alert | Severity | Fires when |
+|---|---|---|
+| `PodCrashLooping` | warning | A container restarted more than 3 times in 15 minutes, for 2 minutes |
+| `AegisControllerDown` | critical | No controller replica can be scraped for 5 minutes |
+| `AegisNoLeader` | critical | Replicas are up but none holds the Lease for 2 minutes |
+| `AegisSplitBrain` | critical | More than one replica reports itself as leader for 1 minute |
+| `AegisRemediationSpike` | warning | More than 5 pods remediated in 10 minutes |
+
+Run the rule tests locally with Docker:
+
+```powershell
+python -c "import yaml; yaml.safe_dump(yaml.safe_load(open('manifests/prometheus-rules.yaml'))['spec'], open('tests/prometheus/rules.generated.yaml','w'))"
+docker run --rm -v "${PWD}/tests/prometheus:/w" -w /w --entrypoint promtool prom/prometheus:v3.5.0 test rules rules.test.yaml
+```
 
 ## Security
 
@@ -428,15 +480,17 @@ az group delete --name aegis-rg --yes --no-wait   # teardown
 ## CI/CD
 
 [`.github/workflows/build.yaml`](.github/workflows/build.yaml) runs on every pull request
-and every push to `main` that touches `controller/` or the workflow itself.
+and every push to `main` that touches the controller, manifests, tests, scripts or the
+workflow itself.
 
 | Job | What it checks |
 |---|---|
 | `test` | `gofmt` (fails on any unformatted file), `go mod tidy` leaves no diff, `go vet`, and `go test -race` across all packages |
-| `build` | Runs after `test`. On pull requests, builds the image to prove the Dockerfile works. On `main`, also pushes `ghcr.io/viditpawar/aegis-self-healing-k8s-controller` as `:latest` and `:sha-<commit>` |
+| `manifests` | kubeconform in strict mode on every manifest, with schemas for the Argo Rollouts and Prometheus Operator CRDs. `promtool check rules` and `promtool test rules` on the alert rules. The Grafana dashboard JSON parses, and both PowerShell scripts parse |
+| `build` | Runs after `test` and `manifests`. On pull requests, builds the image to prove the Dockerfile works. On `main`, also pushes `ghcr.io/viditpawar/aegis-self-healing-k8s-controller` as `:latest` and `:sha-<commit>` |
 
-Each job is granted only the permissions it needs: `test` gets `contents: read`, and only
-`build` also gets `packages: write`, and it uses the built-in `GITHUB_TOKEN`, so no cloud credentials are
+Each job is granted only the permissions it needs: `test` and `manifests` get
+`contents: read`, and only `build` also gets `packages: write`, and it uses the built-in `GITHUB_TOKEN`, so no cloud credentials are
 stored in the repository.
 
 To run the same checks locally:
@@ -463,18 +517,18 @@ go test ./...
 - [x] Pod Security Standards and default-deny NetworkPolicy
 - [x] CI: formatting, tidy, vet, race tests, image publishing to GHCR
 - [x] One-command local setup
+- [x] Canary analysis scoped to the canary's own pods, with a verified abort of a bad release
+- [x] Alerts on the controller itself, and `promtool` unit tests for every rule
+- [x] Remediation guardrails: deletion rate limit and opt-out annotation
+- [x] Manifest schema validation in CI
 
 **Next**
 
 - **End-to-end test in CI:** bring up kind in GitHub Actions, run the crash-loop and
   failover checks, and fail the build if remediation doesn't happen.
 - **Helm chart** for the controller, so EKS and AKS installs are one command too.
-- **Scope the canary analysis** to the demo app's own series (`namespace`, `app` labels).
-  Today the query divides all `http_requests_total` in the cluster.
-- **Remediation guardrails:** a per-workload rate limit and an opt-out annotation, so a
-  bad release can't trigger a wave of deletions.
-- **Alerts on the controller itself:** no active leader, more than one leader, and
-  remediation rate spikes.
+- **Per-workload limits:** the rate limit is global today; a per-Deployment budget would
+  stop one bad workload from using up the limit for everything else.
 - **Image scanning** with Trivy and pinned action SHAs in CI.
 
 ## License

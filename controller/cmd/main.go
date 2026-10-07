@@ -42,12 +42,13 @@ func main() {
 
 	go metrics.Serve(ctx, metricsAddr)
 
-	log.Printf("Aegis controller started, watching pods in %s (max restarts %d, pending timeout %v)",
-		cfg.Namespace, cfg.Policy.MaxRestarts, cfg.Policy.PendingTimeout)
+	log.Printf("Aegis controller started, watching pods in %s (max restarts %d, pending timeout %v, max %d deletions/min)",
+		cfg.Namespace, cfg.Policy.MaxRestarts, cfg.Policy.PendingTimeout, cfg.MaxDeletionsPerMinute)
 
 	c := controller.New(clientset, recorder, cfg, controller.Counters{
 		CrashLoop: metrics.CrashLoopDeletions,
 		Pending:   metrics.PendingDeletions,
+		Throttled: metrics.Throttled,
 	})
 
 	if cfg.LeaderElection {

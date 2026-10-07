@@ -20,6 +20,7 @@ func TestHandler(t *testing.T) {
 		{"/metrics", "aegis_crashloop_deletions_total"},
 		{"/metrics", "aegis_pending_deletions_total"},
 		{"/metrics", "aegis_leader"},
+		{"/metrics", "aegis_remediations_throttled_total"},
 	}
 
 	for _, tc := range cases {

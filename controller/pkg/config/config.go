@@ -15,18 +15,24 @@ const (
 	EnvMaxRestarts    = "AEGIS_MAX_RESTARTS"
 	EnvPendingTimeout = "AEGIS_PENDING_TIMEOUT"
 	EnvLeaderElection = "AEGIS_LEADER_ELECTION"
+	EnvMaxDeletions   = "AEGIS_MAX_DELETIONS_PER_MINUTE"
 
 	// Set from the downward API; required when leader election is on.
 	EnvPodName      = "POD_NAME"
 	EnvPodNamespace = "POD_NAMESPACE"
 
-	DefaultNamespace = "aegis-workloads"
+	DefaultNamespace             = "aegis-workloads"
+	DefaultMaxDeletionsPerMinute = 10
 )
 
 // Config is everything the controller needs to know at startup.
 type Config struct {
 	Namespace string
 	Policy    remediate.Policy
+
+	// MaxDeletionsPerMinute caps how many pods are deleted per minute, so a
+	// bad release can't turn into a wave of deletions. 0 disables the cap.
+	MaxDeletionsPerMinute int
 
 	// LeaderElection makes replicas compete for a Lease in LeaseNamespace,
 	// identifying themselves as Identity; only the leader remediates.
@@ -40,8 +46,9 @@ type Config struct {
 // Deployment fails loudly at startup.
 func Load(getenv func(string) string) (Config, error) {
 	cfg := Config{
-		Namespace: DefaultNamespace,
-		Policy:    remediate.DefaultPolicy(),
+		Namespace:             DefaultNamespace,
+		Policy:                remediate.DefaultPolicy(),
+		MaxDeletionsPerMinute: DefaultMaxDeletionsPerMinute,
 	}
 
 	if v := getenv(EnvNamespace); v != "" {
@@ -62,6 +69,14 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be a positive duration like 5m, got %q", EnvPendingTimeout, v)
 		}
 		cfg.Policy.PendingTimeout = d
+	}
+
+	if v := getenv(EnvMaxDeletions); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return Config{}, fmt.Errorf("%s must be a non-negative integer (0 disables the limit), got %q", EnvMaxDeletions, v)
+		}
+		cfg.MaxDeletionsPerMinute = n
 	}
 
 	if v := getenv(EnvLeaderElection); v != "" {

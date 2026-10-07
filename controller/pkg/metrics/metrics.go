@@ -25,6 +25,11 @@ var (
 		Help: "Total number of pods deleted for being stuck Pending.",
 	})
 
+	Throttled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "aegis_remediations_throttled_total",
+		Help: "Remediations skipped because AEGIS_MAX_DELETIONS_PER_MINUTE was reached; they are retried later.",
+	})
+
 	IsLeader = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "aegis_leader",
 		Help: "1 if this replica is the active (remediating) controller, 0 if it's on standby.",

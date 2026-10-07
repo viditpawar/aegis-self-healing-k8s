@@ -5,10 +5,16 @@ on:
     branches: [main]
     paths:
       - 'controller/**'
+      - 'manifests/**'
+      - 'tests/**'
+      - 'scripts/**'
       - '.github/workflows/build.yaml'
   pull_request:
     paths:
       - 'controller/**'
+      - 'manifests/**'
+      - 'tests/**'
+      - 'scripts/**'
       - '.github/workflows/build.yaml'
 
 jobs:
@@ -44,8 +50,55 @@ jobs:
       - name: Test
         run: go test -race ./...
 
+  manifests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+
+      # Strict schema validation, including the Argo Rollouts and Prometheus
+      # Operator CRDs. alertmanager-values.yaml is Helm values, not a manifest.
+      - name: Validate manifests (kubeconform)
+        run: |
+          go run github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7 \
+            -strict -summary \
+            -ignore-filename-pattern 'alertmanager-values' \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            manifests
+
+      - name: Extract alert rules from the PrometheusRule
+        run: yq '.spec' manifests/prometheus-rules.yaml > tests/prometheus/rules.generated.yaml
+
+      - name: Check and unit test alert rules (promtool)
+        run: |
+          docker run --rm -v "$PWD/tests/prometheus:/w" -w /w --entrypoint promtool \
+            prom/prometheus:v3.5.0 check rules rules.generated.yaml
+          docker run --rm -v "$PWD/tests/prometheus:/w" -w /w --entrypoint promtool \
+            prom/prometheus:v3.5.0 test rules rules.test.yaml
+
+      - name: Validate Grafana dashboard JSON
+        run: yq '.data["aegis-controller-dashboard.json"]' manifests/monitoring/grafana-dashboard.yaml | jq empty
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          foreach ($f in Get-ChildItem scripts -Filter *.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            if ($errors) { $errors; throw "$($f.Name) has syntax errors" }
+            "$($f.Name) parses OK"
+          }
+
   build:
-    needs: test
+    needs: [test, manifests]
     runs-on: ubuntu-latest
     permissions:
       contents: read

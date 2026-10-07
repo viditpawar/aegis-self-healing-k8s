@@ -34,6 +34,7 @@ func newTestController(t *testing.T, pods ...*corev1.Pod) (*Controller, *fake.Cl
 	c := New(client, recorder, cfg, Counters{
 		CrashLoop: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_crashloop"}),
 		Pending:   prometheus.NewCounter(prometheus.CounterOpts{Name: "test_pending"}),
+		Throttled: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_throttled"}),
 	})
 	return c, client, recorder
 }
@@ -242,5 +243,59 @@ func TestRunStopsOnCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestRateLimitThrottlesAndRetries(t *testing.T) {
+	pods := []*corev1.Pod{crashLoopingPod("a", 6), crashLoopingPod("b", 6), crashLoopingPod("c", 6)}
+	client := fake.NewSimpleClientset()
+	for _, p := range pods {
+		if _, err := client.CoreV1().Pods(ns).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("seeding pod %s: %v", p.Name, err)
+		}
+	}
+	cfg := config.Config{Namespace: ns, Policy: remediate.DefaultPolicy(), MaxDeletionsPerMinute: 2}
+	c := New(client, record.NewFakeRecorder(10), cfg, Counters{
+		CrashLoop: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_crashloop"}),
+		Pending:   prometheus.NewCounter(prometheus.CounterOpts{Name: "test_pending"}),
+		Throttled: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_throttled"}),
+	})
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	for _, p := range pods {
+		c.HandlePod(context.Background(), p)
+	}
+	if got := testutil.ToFloat64(c.counters.CrashLoop); got != 2 {
+		t.Errorf("deleted %v pods with a limit of 2/min, want 2", got)
+	}
+	if got := testutil.ToFloat64(c.counters.Throttled); got != 1 {
+		t.Errorf("throttled = %v, want 1", got)
+	}
+	if !podExists(t, client, "c") {
+		t.Fatal("third pod was deleted despite the rate limit")
+	}
+
+	// Half a minute later one token has refilled; the throttled pod's next
+	// event goes through because its UID wasn't left marked in-flight.
+	now = now.Add(30 * time.Second)
+	c.HandlePod(context.Background(), pods[2])
+	if podExists(t, client, "c") {
+		t.Error("throttled pod was not deleted after the limit refilled")
+	}
+}
+
+func TestOptedOutPodIsKept(t *testing.T) {
+	pod := crashLoopingPod("debugging", 50)
+	pod.Annotations = map[string]string{remediate.OptOutAnnotation: "false"}
+	c, client, recorder := newTestController(t, pod)
+
+	c.HandlePod(context.Background(), pod)
+
+	if !podExists(t, client, pod.Name) {
+		t.Error("opted-out pod was deleted")
+	}
+	if len(recorder.Events) != 0 {
+		t.Errorf("recorded %d events for an opted-out pod, want 0", len(recorder.Events))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +36,7 @@ const (
 	// `kubectl get events` or `kubectl describe pod`.
 	ReasonCrashLoopRemediated = "CrashLoopRemediated"
 	ReasonPendingRemediated   = "PendingRemediated"
+	ReasonThrottled           = "RemediationThrottled"
 )
 
 // Counters are the metrics the controller increments on a successful
@@ -42,6 +44,7 @@ const (
 type Counters struct {
 	CrashLoop prometheus.Counter
 	Pending   prometheus.Counter
+	Throttled prometheus.Counter
 }
 
 // Controller remediates unhealthy pods in a single namespace.
@@ -51,6 +54,9 @@ type Controller struct {
 	cfg      config.Config
 	counters Counters
 	now      func() time.Time
+
+	// limiter caps deletions per minute; nil means unlimited.
+	limiter *rate.Limiter
 
 	// inFlight deduplicates delete attempts for the same pod UID that
 	// arrive close together (e.g. an informer resync racing a real
@@ -63,7 +69,7 @@ type Controller struct {
 // New returns a Controller watching cfg.Namespace through client, and
 // recording an Event on every pod it remediates.
 func New(client kubernetes.Interface, recorder record.EventRecorder, cfg config.Config, counters Counters) *Controller {
-	return &Controller{
+	c := &Controller{
 		client:   client,
 		recorder: recorder,
 		cfg:      cfg,
@@ -71,6 +77,11 @@ func New(client kubernetes.Interface, recorder record.EventRecorder, cfg config.
 		now:      time.Now,
 		inFlight: map[types.UID]time.Time{},
 	}
+	if n := cfg.MaxDeletionsPerMinute; n > 0 {
+		// A full bucket of n, refilled evenly over the minute.
+		c.limiter = rate.NewLimiter(rate.Every(time.Minute/time.Duration(n)), n)
+	}
+	return c
 }
 
 // Run starts the pod informer and the Pending sweep, and blocks until ctx
@@ -147,6 +158,16 @@ func (c *Controller) deletePod(ctx context.Context, pod corev1.Pod, reason, even
 	if pod.DeletionTimestamp != nil || !c.markInFlight(pod.UID) {
 		return
 	}
+	if c.limiter != nil && !c.limiter.AllowN(c.now(), 1) {
+		// Forget the UID so the next resync or sweep can try again once
+		// the limit has refilled.
+		c.clearInFlight(pod.UID)
+		c.counters.Throttled.Inc()
+		log.Printf("Pod %s: %s, but the deletion rate limit was reached; will retry", pod.Name, reason)
+		c.recorder.Eventf(&pod, corev1.EventTypeWarning, ReasonThrottled,
+			"aegis-controller deletion rate limit reached, will retry: %s", reason)
+		return
+	}
 
 	log.Printf("Pod %s: %s, deleting to force reschedule", pod.Name, reason)
 	if err := c.client.CoreV1().Pods(pod.Namespace).Delete(
@@ -178,4 +199,10 @@ func (c *Controller) markInFlight(uid types.UID) bool {
 	}
 	c.inFlight[uid] = now.Add(inFlightTTL)
 	return true
+}
+
+func (c *Controller) clearInFlight(uid types.UID) {
+	c.inFlightMu.Lock()
+	defer c.inFlightMu.Unlock()
+	delete(c.inFlight, uid)
 }

@@ -13,6 +13,10 @@ import (
 const (
 	DefaultMaxRestarts    = 5
 	DefaultPendingTimeout = 5 * time.Minute
+
+	// OptOutAnnotation exempts a pod from remediation when set to "false",
+	// e.g. while debugging a crash loop by hand.
+	OptOutAnnotation = "aegis/remediate"
 )
 
 // Policy holds the thresholds remediation decisions are made against.
@@ -32,6 +36,9 @@ func DefaultPolicy() Policy {
 // CrashLoopDecision reports whether pod should be deleted because it is
 // stuck in CrashLoopBackOff past p.MaxRestarts.
 func (p Policy) CrashLoopDecision(pod corev1.Pod) (shouldDelete bool, reason string) {
+	if OptedOut(pod) {
+		return false, ""
+	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.RestartCount > p.MaxRestarts && cs.State.Waiting != nil &&
 			cs.State.Waiting.Reason == "CrashLoopBackOff" {
@@ -44,7 +51,7 @@ func (p Policy) CrashLoopDecision(pod corev1.Pod) (shouldDelete bool, reason str
 // PendingDecision reports whether pod should be deleted because it has been
 // stuck Pending for longer than p.PendingTimeout, relative to now.
 func (p Policy) PendingDecision(pod corev1.Pod, now time.Time) (shouldDelete bool, reason string) {
-	if pod.Status.Phase != corev1.PodPending {
+	if OptedOut(pod) || pod.Status.Phase != corev1.PodPending {
 		return false, ""
 	}
 	age := now.Sub(pod.CreationTimestamp.Time)
@@ -52,4 +59,9 @@ func (p Policy) PendingDecision(pod corev1.Pod, now time.Time) (shouldDelete boo
 		return true, fmt.Sprintf("stuck Pending for %v", age.Round(time.Second))
 	}
 	return false, ""
+}
+
+// OptedOut reports whether pod carries OptOutAnnotation set to "false".
+func OptedOut(pod corev1.Pod) bool {
+	return pod.Annotations[OptOutAnnotation] == "false"
 }

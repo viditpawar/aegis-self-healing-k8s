@@ -31,6 +31,8 @@ spec:
               value: "5"
             - name: AEGIS_PENDING_TIMEOUT
               value: 5m
+            - name: AEGIS_MAX_DELETIONS_PER_MINUTE
+              value: "10"
             - name: AEGIS_LEADER_ELECTION
               value: "true"
             - name: POD_NAME
