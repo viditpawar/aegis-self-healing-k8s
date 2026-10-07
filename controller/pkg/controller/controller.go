@@ -17,8 +17,9 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
-	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/remediate"
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/config"
 )
 
 const (
@@ -29,6 +30,11 @@ const (
 	// deleted", to absorb the race between an informer resync/real-update
 	// event and the delete actually landing, without leaking memory forever.
 	inFlightTTL = 2 * time.Minute
+
+	// Event reasons recorded on a pod when it's remediated, visible via
+	// `kubectl get events` or `kubectl describe pod`.
+	ReasonCrashLoopRemediated = "CrashLoopRemediated"
+	ReasonPendingRemediated   = "PendingRemediated"
 )
 
 // Counters are the metrics the controller increments on a successful
@@ -40,10 +46,11 @@ type Counters struct {
 
 // Controller remediates unhealthy pods in a single namespace.
 type Controller struct {
-	client    kubernetes.Interface
-	namespace string
-	counters  Counters
-	now       func() time.Time
+	client   kubernetes.Interface
+	recorder record.EventRecorder
+	cfg      config.Config
+	counters Counters
+	now      func() time.Time
 
 	// inFlight deduplicates delete attempts for the same pod UID that
 	// arrive close together (e.g. an informer resync racing a real
@@ -53,14 +60,16 @@ type Controller struct {
 	inFlight   map[types.UID]time.Time
 }
 
-// New returns a Controller watching namespace through client.
-func New(client kubernetes.Interface, namespace string, counters Counters) *Controller {
+// New returns a Controller watching cfg.Namespace through client, and
+// recording an Event on every pod it remediates.
+func New(client kubernetes.Interface, recorder record.EventRecorder, cfg config.Config, counters Counters) *Controller {
 	return &Controller{
-		client:    client,
-		namespace: namespace,
-		counters:  counters,
-		now:       time.Now,
-		inFlight:  map[types.UID]time.Time{},
+		client:   client,
+		recorder: recorder,
+		cfg:      cfg,
+		counters: counters,
+		now:      time.Now,
+		inFlight: map[types.UID]time.Time{},
 	}
 }
 
@@ -69,7 +78,7 @@ func New(client kubernetes.Interface, namespace string, counters Counters) *Cont
 func (c *Controller) Run(ctx context.Context) error {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		c.client, informerResync,
-		informers.WithNamespace(c.namespace),
+		informers.WithNamespace(c.cfg.Namespace),
 	)
 	podInformer := factory.Core().V1().Pods().Informer()
 
@@ -113,28 +122,28 @@ func (c *Controller) HandlePod(ctx context.Context, obj interface{}) {
 	if !ok {
 		return
 	}
-	if shouldDelete, reason := remediate.CrashLoopDecision(*pod); shouldDelete {
-		c.deletePod(ctx, *pod, reason, c.counters.CrashLoop)
+	if shouldDelete, reason := c.cfg.Policy.CrashLoopDecision(*pod); shouldDelete {
+		c.deletePod(ctx, *pod, reason, ReasonCrashLoopRemediated, c.counters.CrashLoop)
 	}
 }
 
 // SweepPending deletes every pod in the namespace that's been stuck Pending
-// past remediate.PendingTimeout.
+// past the configured Pending timeout.
 func (c *Controller) SweepPending(ctx context.Context) {
-	pods, err := c.client.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{})
+	pods, err := c.client.CoreV1().Pods(c.cfg.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("error listing pods: %v", err)
 		return
 	}
 	now := c.now()
 	for _, pod := range pods.Items {
-		if shouldDelete, reason := remediate.PendingDecision(pod, now); shouldDelete {
-			c.deletePod(ctx, pod, reason, c.counters.Pending)
+		if shouldDelete, reason := c.cfg.Policy.PendingDecision(pod, now); shouldDelete {
+			c.deletePod(ctx, pod, reason, ReasonPendingRemediated, c.counters.Pending)
 		}
 	}
 }
 
-func (c *Controller) deletePod(ctx context.Context, pod corev1.Pod, reason string, counter prometheus.Counter) {
+func (c *Controller) deletePod(ctx context.Context, pod corev1.Pod, reason, eventReason string, counter prometheus.Counter) {
 	if pod.DeletionTimestamp != nil || !c.markInFlight(pod.UID) {
 		return
 	}
@@ -146,6 +155,8 @@ func (c *Controller) deletePod(ctx context.Context, pod corev1.Pod, reason strin
 		return
 	}
 	counter.Inc()
+	c.recorder.Eventf(&pod, corev1.EventTypeWarning, eventReason,
+		"Deleted by aegis-controller to force reschedule: %s", reason)
 }
 
 // markInFlight returns true if uid was not already being processed, and

@@ -7,30 +7,44 @@ import (
 	"os/signal"
 	"syscall"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
+
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/config"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/controller"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/k8sclient"
 	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/metrics"
 )
 
-const (
-	targetNamespace = "aegis-workloads"
-	metricsAddr     = ":8080"
-)
+const metricsAddr = ":8080"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
 
 	clientset, err := k8sclient.New()
 	if err != nil {
 		log.Fatalf("failed to create clientset: %v", err)
 	}
 
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientset.CoreV1().Events("")})
+	defer broadcaster.Shutdown()
+	recorder := broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "aegis-controller"})
+
 	go metrics.Serve(ctx, metricsAddr)
 
-	log.Println("Aegis controller started, watching pods in", targetNamespace)
+	log.Printf("Aegis controller started, watching pods in %s (max restarts %d, pending timeout %v)",
+		cfg.Namespace, cfg.Policy.MaxRestarts, cfg.Policy.PendingTimeout)
 
-	c := controller.New(clientset, targetNamespace, controller.Counters{
+	c := controller.New(clientset, recorder, cfg, controller.Counters{
 		CrashLoop: metrics.CrashLoopDeletions,
 		Pending:   metrics.PendingDeletions,
 	})

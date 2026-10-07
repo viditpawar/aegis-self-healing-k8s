@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,11 +13,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
+
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/config"
+	"github.com/viditpawar/aegis-self-healing-k8s/controller/pkg/remediate"
 )
 
 const ns = "aegis-workloads"
 
-func newTestController(t *testing.T, pods ...*corev1.Pod) (*Controller, *fake.Clientset) {
+func newTestController(t *testing.T, pods ...*corev1.Pod) (*Controller, *fake.Clientset, *record.FakeRecorder) {
 	t.Helper()
 	client := fake.NewSimpleClientset()
 	for _, p := range pods {
@@ -24,11 +29,13 @@ func newTestController(t *testing.T, pods ...*corev1.Pod) (*Controller, *fake.Cl
 			t.Fatalf("seeding pod %s: %v", p.Name, err)
 		}
 	}
-	c := New(client, ns, Counters{
+	recorder := record.NewFakeRecorder(10)
+	cfg := config.Config{Namespace: ns, Policy: remediate.DefaultPolicy()}
+	c := New(client, recorder, cfg, Counters{
 		CrashLoop: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_crashloop"}),
 		Pending:   prometheus.NewCounter(prometheus.CounterOpts{Name: "test_pending"}),
 	})
-	return c, client
+	return c, client, recorder
 }
 
 func crashLoopingPod(name string, restarts int32) *corev1.Pod {
@@ -79,7 +86,7 @@ func TestHandlePod(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, client := newTestController(t, tc.pod)
+			c, client, recorder := newTestController(t, tc.pod)
 
 			c.HandlePod(context.Background(), tc.pod)
 
@@ -93,12 +100,15 @@ func TestHandlePod(t *testing.T) {
 			if got := testutil.ToFloat64(c.counters.CrashLoop); got != wantCount {
 				t.Errorf("crashloop counter = %v, want %v", got, wantCount)
 			}
+			if got := len(recorder.Events); got != int(wantCount) {
+				t.Errorf("recorded %d events, want %v", got, wantCount)
+			}
 		})
 	}
 }
 
 func TestHandlePodIgnoresNonPods(t *testing.T) {
-	c, _ := newTestController(t)
+	c, _, _ := newTestController(t)
 	c.HandlePod(context.Background(), "not a pod")
 	if got := testutil.ToFloat64(c.counters.CrashLoop); got != 0 {
 		t.Errorf("crashloop counter = %v, want 0", got)
@@ -109,7 +119,7 @@ func TestHandlePodSkipsTerminatingPod(t *testing.T) {
 	pod := crashLoopingPod("terminating", 6)
 	now := metav1.Now()
 	pod.DeletionTimestamp = &now
-	c, client := newTestController(t, pod)
+	c, client, _ := newTestController(t, pod)
 
 	c.HandlePod(context.Background(), pod)
 
@@ -122,7 +132,7 @@ func TestHandlePodSkipsTerminatingPod(t *testing.T) {
 // be deleted and counted once.
 func TestHandlePodDedupesSameUID(t *testing.T) {
 	pod := crashLoopingPod("bad", 6)
-	c, client := newTestController(t, pod)
+	c, client, _ := newTestController(t, pod)
 
 	c.HandlePod(context.Background(), pod)
 	// Recreate so a second delete would succeed if dedup didn't stop it.
@@ -140,7 +150,7 @@ func TestHandlePodDedupesSameUID(t *testing.T) {
 }
 
 func TestMarkInFlightExpires(t *testing.T) {
-	c, _ := newTestController(t)
+	c, _, _ := newTestController(t)
 	now := time.Now()
 	c.now = func() time.Time { return now }
 
@@ -164,7 +174,7 @@ func TestSweepPending(t *testing.T) {
 	now := time.Now()
 	stuck := pendingPod("stuck", now.Add(-10*time.Minute))
 	fresh := pendingPod("fresh", now.Add(-1*time.Minute))
-	c, client := newTestController(t, stuck, fresh)
+	c, client, recorder := newTestController(t, stuck, fresh)
 	c.now = func() time.Time { return now }
 
 	c.SweepPending(context.Background())
@@ -178,10 +188,47 @@ func TestSweepPending(t *testing.T) {
 	if got := testutil.ToFloat64(c.counters.Pending); got != 1 {
 		t.Errorf("pending counter = %v, want 1", got)
 	}
+	select {
+	case ev := <-recorder.Events:
+		if !strings.HasPrefix(ev, "Warning "+ReasonPendingRemediated+" ") {
+			t.Errorf("event = %q, want a Warning %s event", ev, ReasonPendingRemediated)
+		}
+	default:
+		t.Error("no event recorded for the deleted Pending pod")
+	}
+}
+
+func TestCrashLoopEvent(t *testing.T) {
+	pod := crashLoopingPod("bad", 6)
+	c, _, recorder := newTestController(t, pod)
+
+	c.HandlePod(context.Background(), pod)
+
+	select {
+	case ev := <-recorder.Events:
+		want := "Warning " + ReasonCrashLoopRemediated + " Deleted by aegis-controller to force reschedule: CrashLoopBackOff, restart count 6"
+		if ev != want {
+			t.Errorf("event = %q, want %q", ev, want)
+		}
+	default:
+		t.Error("no event recorded for the deleted crash-looping pod")
+	}
+}
+
+func TestHandlePodUsesConfiguredPolicy(t *testing.T) {
+	pod := crashLoopingPod("flaky", 2)
+	c, client, _ := newTestController(t, pod)
+	c.cfg.Policy.MaxRestarts = 1
+
+	c.HandlePod(context.Background(), pod)
+
+	if podExists(t, client, pod.Name) {
+		t.Error("pod over the configured MaxRestarts of 1 was not deleted")
+	}
 }
 
 func TestRunStopsOnCancel(t *testing.T) {
-	c, _ := newTestController(t)
+	c, _, _ := newTestController(t)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)

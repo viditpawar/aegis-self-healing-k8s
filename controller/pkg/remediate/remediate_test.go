@@ -17,7 +17,7 @@ func TestCrashLoopDecision(t *testing.T) {
 	}{
 		{"6 restarts with CrashLoopBackOff reason", 6, "CrashLoopBackOff", true},
 		{"2 restarts with CrashLoopBackOff reason", 2, "CrashLoopBackOff", false},
-		{"exactly MaxRestarts is not enough", MaxRestarts, "CrashLoopBackOff", false},
+		{"exactly DefaultMaxRestarts is not enough", DefaultMaxRestarts, "CrashLoopBackOff", false},
 		{"many restarts but waiting for another reason", 10, "ImagePullBackOff", false},
 	}
 
@@ -36,7 +36,7 @@ func TestCrashLoopDecision(t *testing.T) {
 				},
 			}
 
-			got, _ := CrashLoopDecision(pod)
+			got, _ := DefaultPolicy().CrashLoopDecision(pod)
 			if got != tc.wantDelete {
 				t.Errorf("CrashLoopDecision() = %v, want %v", got, tc.wantDelete)
 			}
@@ -54,7 +54,7 @@ func TestPendingDecision(t *testing.T) {
 	}{
 		{"pending for 10 minutes", 10 * time.Minute, true},
 		{"pending for 1 minute", 1 * time.Minute, false},
-		{"pending for exactly PendingTimeout", PendingTimeout, false},
+		{"pending for exactly DefaultPendingTimeout", DefaultPendingTimeout, false},
 	}
 
 	for _, tc := range cases {
@@ -68,7 +68,7 @@ func TestPendingDecision(t *testing.T) {
 				},
 			}
 
-			got, _ := PendingDecision(pod, now)
+			got, _ := DefaultPolicy().PendingDecision(pod, now)
 			if got != tc.wantDelete {
 				t.Errorf("PendingDecision() = %v, want %v", got, tc.wantDelete)
 			}
@@ -85,7 +85,7 @@ func TestCrashLoopDecisionRunningContainer(t *testing.T) {
 			}},
 		},
 	}
-	if got, _ := CrashLoopDecision(pod); got {
+	if got, _ := DefaultPolicy().CrashLoopDecision(pod); got {
 		t.Error("CrashLoopDecision() = true for a running container, want false")
 	}
 }
@@ -96,7 +96,40 @@ func TestPendingDecisionIgnoresRunningPods(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-time.Hour))},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	if got, _ := PendingDecision(pod, now); got {
+	if got, _ := DefaultPolicy().PendingDecision(pod, now); got {
 		t.Error("PendingDecision() = true for a Running pod, want false")
+	}
+}
+
+func TestPolicyThresholdsAreConfigurable(t *testing.T) {
+	now := time.Now()
+	strict := Policy{MaxRestarts: 1, PendingTimeout: 30 * time.Second}
+
+	crashing := corev1.Pod{
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				RestartCount: 2,
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				},
+			}},
+		},
+	}
+	if got, _ := strict.CrashLoopDecision(crashing); !got {
+		t.Error("strict policy should delete a pod with 2 restarts")
+	}
+	if got, _ := DefaultPolicy().CrashLoopDecision(crashing); got {
+		t.Error("default policy should keep a pod with 2 restarts")
+	}
+
+	pending := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-time.Minute))},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	if got, _ := strict.PendingDecision(pending, now); !got {
+		t.Error("strict policy should delete a pod Pending for 1 minute")
+	}
+	if got, _ := DefaultPolicy().PendingDecision(pending, now); got {
+		t.Error("default policy should keep a pod Pending for 1 minute")
 	}
 }

@@ -63,7 +63,8 @@ flowchart TB
   `SharedInformerFactory` (event-driven, not polling) and deletes any pod
   that's crash-looping (`RestartCount > 5` with reason `CrashLoopBackOff`).
   A separate ticker goroutine sweeps for pods stuck `Pending` for more than 5
-  minutes every 30s, since informers only fire on state changes and an idle
+  minutes every 30s (namespace and both thresholds are configurable — see
+  [Configuration](#configuration)), since informers only fire on state changes and an idle
   Pending pod never produces one. Concurrent delete attempts for the same pod
   (e.g. an informer resync racing a real update) are deduplicated by pod UID
   so remediation metrics stay exact. The decision logic is pure and
@@ -71,7 +72,9 @@ flowchart TB
   client (`controller/pkg/k8sclient`) and Prometheus metrics
   (`controller/pkg/metrics`: `aegis_crashloop_deletions_total` /
   `aegis_pending_deletions_total`, exposed on `:8080/metrics` and scraped via
-  a `ServiceMonitor`). The pod itself runs as non-root with all capabilities
+  a `ServiceMonitor`). Every deletion also records a Kubernetes `Warning`
+  Event (`CrashLoopRemediated` / `PendingRemediated`) so `kubectl get events`
+  shows why a pod disappeared. The pod itself runs as non-root with all capabilities
   dropped, satisfying the `restricted` Pod Security Standard enforced on
   `aegis-system`.
 - **`monitoring`** — `kube-prometheus-stack` (Prometheus, Alertmanager,
@@ -232,6 +235,22 @@ If you add new workloads behind the `default-deny-ingress` policy in
 Prometheus scrapes and inter-pod traffic will silently time out, which is
 exactly the failure mode that motivated this note.
 
+## Configuration
+
+The controller reads these environment variables, set in
+`manifests/controller/deployment.yaml`. Invalid values stop the controller
+at startup instead of silently falling back to defaults.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AEGIS_NAMESPACE` | `aegis-workloads` | Namespace to watch and remediate |
+| `AEGIS_MAX_RESTARTS` | `5` | Delete a `CrashLoopBackOff` pod once restarts exceed this |
+| `AEGIS_PENDING_TIMEOUT` | `5m` | Delete a pod stuck `Pending` longer than this (Go duration: `90s`, `10m`) |
+
+If you change `AEGIS_NAMESPACE`, the existing RBAC still works (it's a
+`ClusterRole`), but the namespace's Pod Security and NetworkPolicy setup is
+up to you.
+
 ## Verifying self-healing
 
 ```powershell
@@ -240,7 +259,9 @@ kubectl logs -n aegis-system -l app=aegis-controller -f
 ```
 
 Once the pod's restart count passes 5, the controller log will show it
-deleting the pod to force a reschedule, and (if Discord alerting is
+deleting the pod to force a reschedule, `kubectl get events -n
+aegis-workloads --field-selector reason=CrashLoopRemediated` will show the
+remediation Event, and (if Discord alerting is
 configured) a `PodCrashLooping` message will land in your channel within a
 couple of minutes.
 
@@ -266,7 +287,8 @@ run traffic-gen --image=busybox -n aegis-workloads --restart=Always -- sh -c
 ```
 controller/
   cmd/main.go                    wiring only: build client, handle SIGTERM, start controller
-  pkg/controller/                informer + Pending sweep + dedup; tested with a fake clientset
+  pkg/config/                    env-var configuration with validation
+  pkg/controller/                informer + Pending sweep + dedup + Events; tested with a fake clientset
   pkg/remediate/                 pure decision functions + table-driven tests
   pkg/k8sclient/                 in-cluster clientset construction
   pkg/metrics/                   Prometheus counters, /metrics and /healthz endpoints

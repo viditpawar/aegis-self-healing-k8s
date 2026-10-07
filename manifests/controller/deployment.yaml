@@ -22,6 +22,13 @@ spec:
         - name: aegis-controller
           image: aegis-controller:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: AEGIS_NAMESPACE
+              value: aegis-workloads
+            - name: AEGIS_MAX_RESTARTS
+              value: "5"
+            - name: AEGIS_PENDING_TIMEOUT
+              value: 5m
           ports:
             - name: metrics
               containerPort: 8080
